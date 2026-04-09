@@ -34,7 +34,7 @@ SHEET_NAME = "포장재 발주관리"
 ABS_LOCAL_EXCEL_PATH = (
     r"C:\Users\vd1p2\바탕 화면\생산기획팀_이창민\2. 참고자료\생산대시보드\새 폴더 (2)\새 폴더\수주제품_대응_포장재_KPI_관리본.xlsx"
 )
-RELATIVE_EXCEL_PATH = str(Path("data") / "data.xlsx")  # for cloud/repo deployment (cross-platform)
+RELATIVE_EXCEL_PATH = "수주제품_대응_포장재_KPI_관리본.xlsx"  # repo default (GitHub sync target)
 
 # Prefer repo-relative path (GitHub deployment); resolve_excel_path falls back to absolute.
 DEFAULT_LOCAL_EXCEL_PATH = RELATIVE_EXCEL_PATH
@@ -514,6 +514,18 @@ def inject_css() -> None:
           /* Bloomberg-ish market header */
           .mi-title { font-size: 14px; font-weight: 600; letter-spacing: 0.2px; color: rgba(230,237,243,0.92); margin: 0 0 4px 0; }
           .mi-sub { font-size: 12px; font-weight: 400; color: rgba(230,237,243,0.70); margin: 0 0 10px 0; }
+          .mi-card {
+            background: #060c18;
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 12px;
+            padding: 12px 14px;
+          }
+          .mi-label { font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.92); margin: 0 0 6px 0; }
+          .mi-value { font-size: 22px; font-weight: 800; color: #ffffff; margin: 0; line-height: 1.1; }
+          .mi-delta { font-size: 12px; font-weight: 700; margin-top: 6px; }
+          .mi-pos { color: #21c36f; }
+          .mi-neg { color: #ff4d4f; }
+          .mi-warn { color: #faad14; }
           [data-testid="stMetricLabel"] > div { font-weight: 500; color: rgba(230,237,243,0.85); }
           [data-testid="stMetricValue"] { font-weight: 700; }
           .kpi-card {
@@ -593,31 +605,55 @@ def main() -> None:
     st.markdown("<div class='mi-sub'>WTI · FX · SCFI · Geopolitics</div>", unsafe_allow_html=True)
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("국제 유가 (WTI)", "$82.45", "▲ 1.2%")
+        st.markdown(
+            "<div class='mi-card'>"
+            "<div class='mi-label'>국제 유가 (WTI)</div>"
+            "<div class='mi-value'>$82.45</div>"
+            "<div class='mi-delta mi-pos'>▲ 1.2%</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
     with m2:
-        st.metric("환율 (USD/KRW)", "1,354.2원", "▼ 0.5%", delta_color="inverse")
+        st.markdown(
+            "<div class='mi-card'>"
+            "<div class='mi-label'>환율 (USD/KRW)</div>"
+            "<div class='mi-value'>1,354.2원</div>"
+            "<div class='mi-delta mi-neg'>▼ 0.5%</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
     with m3:
-        st.metric("해상운임 (SCFI)", "2,150.3", "▲ 15.2")
+        st.markdown(
+            "<div class='mi-card'>"
+            "<div class='mi-label'>해상운임 (SCFI)</div>"
+            "<div class='mi-value'>2,150.3</div>"
+            "<div class='mi-delta mi-pos'>▲ 15.2</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
     with m4:
-        st.metric("공급망 리스크", "주의", "중동 정세")
+        st.markdown(
+            "<div class='mi-card'>"
+            "<div class='mi-label'>공급망 리스크</div>"
+            "<div class='mi-value'>주의</div>"
+            "<div class='mi-delta mi-warn'>중동 정세</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     st.title(APP_TITLE)
     st.caption("Local Excel 동기화 + 리스크 등급화 + (옵션) GitHub 업로드 / Gemini 시나리오 생성")
 
     st.sidebar.header("설정")
-    st.sidebar.caption(f"기본 로드 경로: `{RELATIVE_EXCEL_PATH}` (업로드 없으면 여기서 읽음)")
+    st.sidebar.caption(f"기본 데이터(리포지토리): `{RELATIVE_EXCEL_PATH}`")
     path_input = st.sidebar.text_input("Excel Path (선택)", value=DEFAULT_LOCAL_EXCEL_PATH)
 
     st.sidebar.subheader("업로드 / 동기화")
     uploaded = st.sidebar.file_uploader("새 Excel 업로드(.xlsx)", type=["xlsx"])
     save_local = st.sidebar.checkbox("업로드 파일을 로컬 경로에 저장", value=True)
 
-    st.sidebar.subheader("GitHub Sync (옵션)")
-    github_enabled = st.sidebar.checkbox("업로드 시 GitHub에 푸시", value=True)
-    gh_repo = st.sidebar.text_input("Repo (org/repo)", value="")
-    gh_branch = st.sidebar.text_input("Branch (선택)", value="")
-    gh_repo_path = st.sidebar.text_input("Repo file path", value=f"data/{Path(path_input).name}")
-    gh_token = st.sidebar.text_input("GitHub Token", value="", type="password")
+    st.sidebar.subheader("GitHub Sync (자동)")
+    st.sidebar.caption("업로드 시 `GITHUB_TOKEN`, `GITHUB_REPO`(Secrets)로 자동 푸시됩니다.")
 
     st.sidebar.subheader("Gemini Insight (옵션)")
     default_ai = False
@@ -632,24 +668,42 @@ def main() -> None:
         content = uploaded.getvalue()
         st.sidebar.success(f"업로드 수신: {uploaded.name} ({len(content):,} bytes)")
 
+        # Always save as repo-default filename so all users share the latest
+        repo_target = Path(RELATIVE_EXCEL_PATH)
+        try:
+            repo_target.parent.mkdir(parents=True, exist_ok=True)
+            repo_target.write_bytes(content)
+            st.sidebar.info(f"기본 데이터 파일 저장: {repo_target}")
+            if hasattr(load_packaging_excel, "clear"):
+                load_packaging_excel.clear()  # type: ignore[attr-defined]
+            st.session_state.pop("ai_top5_hash", None)
+            st.session_state.pop("ai_scenarios", None)
+            st.session_state.pop("ai_error", None)
+        except Exception as e:
+            st.sidebar.error(f"기본 데이터 파일 저장 실패: {e}")
+
+        # Optional: also save to user-specified path
         if save_local:
             try:
-                target = Path(path_input)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
-                st.sidebar.info(f"로컬 저장 완료: {target}")
-                if hasattr(load_packaging_excel, "clear"):
-                    load_packaging_excel.clear()  # type: ignore[attr-defined]
+                extra_target = Path(path_input)
+                if str(extra_target) != str(repo_target):
+                    extra_target.parent.mkdir(parents=True, exist_ok=True)
+                    extra_target.write_bytes(content)
+                    st.sidebar.info(f"추가 로컬 저장: {extra_target}")
             except Exception as e:
-                st.sidebar.error(f"로컬 저장 실패: {e}")
+                st.sidebar.warning(f"추가 로컬 저장 실패: {e}")
 
-        if github_enabled:
-            cfg = GitHubConfig(
-                token=gh_token.strip(),
-                repo_full_name=gh_repo.strip(),
-                repo_path=gh_repo_path.strip().lstrip("/"),
-                branch=gh_branch.strip() or None,
-            )
+        # Auto-push to GitHub when secrets exist
+        try:
+            gh_token = str(st.secrets["GITHUB_TOKEN"]).strip()
+            gh_repo = str(st.secrets["GITHUB_REPO"]).strip()
+            gh_branch = str(st.secrets.get("GITHUB_BRANCH", "")).strip() or None
+        except Exception as e:
+            st.sidebar.warning(f"GitHub 자동 푸시 비활성화(Secrets 미설정): {e}")
+            gh_token, gh_repo, gh_branch = "", "", None
+
+        if gh_token and gh_repo:
+            cfg = GitHubConfig(token=gh_token, repo_full_name=gh_repo, repo_path=RELATIVE_EXCEL_PATH, branch=gh_branch)
             ok, msg = github_upsert_excel(content, cfg)
             (st.sidebar.success if ok else st.sidebar.error)(msg)
 
@@ -670,6 +724,22 @@ def main() -> None:
     missing = ensure_required_columns(df, INDEX_COLS + DETAIL_COLS)
     if missing:
         st.warning(f"일부 필수 컬럼이 없습니다(가능한 범위에서 계속 진행): {', '.join(missing)}")
+
+    # ---- Automated AI diagnosis (run once per data load) ----
+    analysis_top5 = top_grade_a_items(df, n=5)
+    analysis_top5_view = analysis_top5[
+        [c for c in ["품목코드", "품목명", "공급처", "필요수량", "재고", "단가", "비고", "RiskReason", "단가_volatility"] if c in analysis_top5.columns]
+    ].copy()
+    analysis_hash = hash_top_items(analysis_top5_view) if not analysis_top5_view.empty else ""
+
+    if gemini_enabled and analysis_hash:
+        if st.session_state.get("ai_top5_hash") != analysis_hash:
+            top5_json = analysis_top5_view.fillna("").to_json(orient="records", force_ascii=False)
+            with st.spinner("Gemini 자동 진단(Top 5 Grade A) 중..."):
+                ok, msg, scenarios = gemini_scenarios_cached(analysis_hash, top5_json)
+            st.session_state["ai_top5_hash"] = analysis_hash
+            st.session_state["ai_scenarios"] = scenarios if ok else []
+            st.session_state["ai_error"] = "" if ok else msg
 
     st.subheader("필터")
     c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.1, 1.1])
@@ -749,7 +819,7 @@ def main() -> None:
 
     # Top 5 Grade A + Automated AI scenarios (cached)
     st.subheader("Top 5 위험 품목 (Grade A)")
-    top5 = top_grade_a_items(dff, n=5)
+    top5 = top_grade_a_items(df, n=5)
     if top5.empty:
         st.info("Grade A 항목이 없습니다.")
     else:
@@ -762,16 +832,21 @@ def main() -> None:
         if gemini_enabled:
             st.subheader("AI 리스크 시나리오 (자동 분석)")
             st.caption("주의: 민감정보가 포함될 수 있으니 전송 전에 검토하세요. (동일 Top5면 캐시로 재호출 방지)")
-
             top5_h = hash_top_items(top5_view)
-            top5_json = top5_view.fillna("").to_json(orient="records", force_ascii=False)
-            with st.spinner("Gemini 자동 분석 중..."):
-                ok, msg, scenarios = gemini_scenarios_cached(top5_h, top5_json)
 
-            if not ok:
-                st.warning(msg)
+            # If the user just enabled the toggle, run once here (still session_state-protected)
+            if st.session_state.get("ai_top5_hash") != top5_h:
+                top5_json = top5_view.fillna("").to_json(orient="records", force_ascii=False)
+                with st.spinner("Gemini 자동 분석 중..."):
+                    ok, msg, scenarios = gemini_scenarios_cached(top5_h, top5_json)
+                st.session_state["ai_top5_hash"] = top5_h
+                st.session_state["ai_scenarios"] = scenarios if ok else []
+                st.session_state["ai_error"] = "" if ok else msg
+
+            if st.session_state.get("ai_error"):
+                st.warning(str(st.session_state.get("ai_error")))
             else:
-                scen_df = pd.DataFrame(scenarios).fillna("-")
+                scen_df = pd.DataFrame(st.session_state.get("ai_scenarios", [])).fillna("-")
                 for c in ["품목코드", "품목명", "우선순위", "시나리오", "원인", "영향", "권장조치"]:
                     if c not in scen_df.columns:
                         scen_df[c] = "-"
