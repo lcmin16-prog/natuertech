@@ -61,13 +61,19 @@ class GitHubConfig:
 def _normalize_col(col: Any) -> str:
     if col is None:
         return ""
-    s = str(col).replace("\n", " ").replace("\r", " ")
+    s = str(col)
+    # remove invisible / zero-width chars often found in Excel exports
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    s = s.replace("\xa0", " ")  # non-breaking space
+    s = s.replace("\n", " ").replace("\r", " ")
     return " ".join(s.split()).strip()
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [_normalize_col(c) for c in df.columns]
+    # extra safety: strip any residual whitespace
+    df.columns = pd.Index([str(c).strip() for c in df.columns])
     return df
 
 
@@ -405,7 +411,11 @@ def style_risk_dataframe(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
     styler = df.style.apply(row_bg, axis=1)
     if "Risk" in df.columns:
-        styler = styler.applymap(risk_cell, subset=["Risk"])
+        # pandas 2.1+: Styler.map (applymap deprecated)
+        if hasattr(styler, "map"):
+            styler = styler.map(risk_cell, subset=["Risk"])
+        else:
+            styler = styler.applymap(risk_cell, subset=["Risk"])
 
     numeric_cols = [c for c in ["수주수량", "필요수량", "재고", "발주수량", "단가", "단가_volatility"] if c in df.columns]
     if numeric_cols:
