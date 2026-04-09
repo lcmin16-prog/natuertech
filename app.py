@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +36,8 @@ ABS_LOCAL_EXCEL_PATH = (
 )
 RELATIVE_EXCEL_PATH = str(Path("data") / "data.xlsx")  # for cloud/repo deployment (cross-platform)
 
-DEFAULT_LOCAL_EXCEL_PATH = RELATIVE_EXCEL_PATH if Path(RELATIVE_EXCEL_PATH).exists() else ABS_LOCAL_EXCEL_PATH
+# Prefer repo-relative path (GitHub deployment); resolve_excel_path falls back to absolute.
+DEFAULT_LOCAL_EXCEL_PATH = RELATIVE_EXCEL_PATH
 
 INDEX_COLS = ["수주일", "제품코드", "제품명", "수주수량"]
 DETAIL_COLS = [
@@ -111,6 +115,11 @@ def load_packaging_excel(path_str: str, sheet_name: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"엑셀 파일을 찾을 수 없습니다: {path}")
     df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    # Safety for invisible spaces in Excel column headers
+    try:
+        df.columns = df.columns.astype(str).str.strip()
+    except Exception:
+        pass
     return normalize_columns(df)
 
 
@@ -299,7 +308,17 @@ def gemini_generate_scenarios(rows: pd.DataFrame) -> tuple[bool, str]:
     )
 
     genai.configure(api_key=api_key)
-    prompt = instructions + "\n\nDATA(JSON):\n" + payload.to_json(orient="records", force_ascii=False)
+    prompt = (
+        instructions
+        + "\n\n반드시 JSON만 출력하세요. 마크다운/설명/코드펜스 없이 JSON만.\n"
+        + "출력 스키마(리스트):\n"
+        + "[{"
+        + '"품목코드": "...", "품목명": "...", '
+        + '"시나리오": "...", "원인": "...", "영향": "...", "권장조치": "...", "우선순위": "High|Medium|Low"'
+        + "}]\n"
+        + "\nDATA(JSON):\n"
+        + payload.to_json(orient="records", force_ascii=False)
+    )
 
     errors: list[str] = []
     for model_name in ["gemini-1.5-flash", "gemini-1.5-flash-latest"]:
@@ -342,6 +361,70 @@ def gemini_generate_scenarios(rows: pd.DataFrame) -> tuple[bool, str]:
         return False, f"Gemini 모델 폴백 실패: {last_err} (시도: {', '.join(candidates)})"
     except Exception as le:
         return False, "Gemini 모델 폴백 실패(모델 목록 조회 실패). " + " / ".join(errors + [str(le)])
+
+
+def _extract_json_array(text: str) -> list[dict[str, Any]] | None:
+    if not text:
+        return None
+    text = text.strip()
+    # direct json
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+    except Exception:
+        pass
+    # try to find first [...] block
+    m = re.search(r"\[[\s\S]*\]", text)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+    except Exception:
+        return None
+    return None
+
+
+def top_grade_a_items(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    d = df.copy()
+    if "Risk" in d.columns:
+        d = d[d["Risk"] == "A"].copy()
+    if d.empty:
+        return d.head(0)
+    # Rank by shortage then volatility
+    if {"필요수량", "재고"}.issubset(d.columns):
+        d["부족량"] = (d["필요수량"] - d["재고"]).clip(lower=0)
+    else:
+        d["부족량"] = 0
+    if "단가_volatility" not in d.columns:
+        d["단가_volatility"] = 0.0
+    d = d.sort_values(["부족량", "단가_volatility"], ascending=[False, False])
+    return d.head(int(n)).copy()
+
+
+def hash_top_items(df: pd.DataFrame) -> str:
+    cols = [c for c in ["품목코드", "품목명", "필요수량", "재고", "단가", "비고", "RiskReason"] if c in df.columns]
+    payload = df[cols].fillna("").to_json(orient="records", force_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@_cache_data(show_spinner=False)
+def gemini_scenarios_cached(top5_hash: str, top5_json: str) -> tuple[bool, str, list[dict[str, Any]]]:
+    # top5_hash is used to key the cache; top5_json carries the actual data.
+    _ = top5_hash
+    try:
+        df = pd.DataFrame(json.loads(top5_json))
+    except Exception:
+        return False, "AI 입력 데이터 파싱 실패", []
+    ok, text = gemini_generate_scenarios(df)
+    if not ok:
+        return False, text, []
+    parsed = _extract_json_array(text)
+    if parsed is None:
+        return False, "AI 응답(JSON) 파싱 실패", []
+    return True, "OK", parsed
 
 
 def format_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -412,10 +495,7 @@ def style_risk_dataframe(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     styler = df.style.apply(row_bg, axis=1)
     if "Risk" in df.columns:
         # pandas 2.1+: Styler.map (applymap deprecated)
-        if hasattr(styler, "map"):
-            styler = styler.map(risk_cell, subset=["Risk"])
-        else:
-            styler = styler.applymap(risk_cell, subset=["Risk"])
+        styler = styler.map(risk_cell, subset=["Risk"])
 
     numeric_cols = [c for c in ["수주수량", "필요수량", "재고", "발주수량", "단가", "단가_volatility"] if c in df.columns]
     if numeric_cols:
@@ -431,6 +511,11 @@ def inject_css() -> None:
           [data-testid="stSidebar"] { background: #070d19; }
           [data-testid="stSidebar"] * { color: #FFFFFF !important; }
           [data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea { color: #FFFFFF !important; }
+          /* Bloomberg-ish market header */
+          .mi-title { font-size: 14px; font-weight: 600; letter-spacing: 0.2px; color: rgba(230,237,243,0.92); margin: 0 0 4px 0; }
+          .mi-sub { font-size: 12px; font-weight: 400; color: rgba(230,237,243,0.70); margin: 0 0 10px 0; }
+          [data-testid="stMetricLabel"] > div { font-weight: 500; color: rgba(230,237,243,0.85); }
+          [data-testid="stMetricValue"] { font-weight: 700; }
           .kpi-card {
             background: linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
             border: 1px solid rgba(255,255,255,0.10);
@@ -438,7 +523,7 @@ def inject_css() -> None:
             padding: 14px 16px;
           }
           .kpi-title { font-size: 12px; color: rgba(230,237,243,0.75); margin-bottom: 6px; }
-          .kpi-value { font-size: 26px; font-weight: 700; line-height: 1.1; }
+          .kpi-value { font-size: 26px; font-weight: 800; line-height: 1.1; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -504,7 +589,8 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     inject_css()
 
-    st.subheader("🌍 글로벌 원가 영향 변수 (Market Intelligence)")
+    st.markdown("<div class='mi-title'>🌍 글로벌 원가 영향 변수 (Market Intelligence)</div>", unsafe_allow_html=True)
+    st.markdown("<div class='mi-sub'>WTI · FX · SCFI · Geopolitics</div>", unsafe_allow_html=True)
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("국제 유가 (WTI)", "$82.45", "▲ 1.2%")
@@ -519,8 +605,8 @@ def main() -> None:
     st.caption("Local Excel 동기화 + 리스크 등급화 + (옵션) GitHub 업로드 / Gemini 시나리오 생성")
 
     st.sidebar.header("설정")
-    path_input = st.sidebar.text_input("Local/Relative Excel Path", value=DEFAULT_LOCAL_EXCEL_PATH)
-    st.sidebar.caption(f"클라우드용 상대경로 예시: `{RELATIVE_EXCEL_PATH}`")
+    st.sidebar.caption(f"기본 로드 경로: `{RELATIVE_EXCEL_PATH}` (업로드 없으면 여기서 읽음)")
+    path_input = st.sidebar.text_input("Excel Path (선택)", value=DEFAULT_LOCAL_EXCEL_PATH)
 
     st.sidebar.subheader("업로드 / 동기화")
     uploaded = st.sidebar.file_uploader("새 Excel 업로드(.xlsx)", type=["xlsx"])
@@ -534,7 +620,12 @@ def main() -> None:
     gh_token = st.sidebar.text_input("GitHub Token", value="", type="password")
 
     st.sidebar.subheader("Gemini Insight (옵션)")
-    gemini_enabled = st.sidebar.checkbox("리스크 시나리오 생성 사용", value=False)
+    default_ai = False
+    try:
+        default_ai = "GEMINI_API_KEY" in st.secrets and bool(str(st.secrets["GEMINI_API_KEY"]).strip())
+    except Exception:
+        default_ai = False
+    gemini_enabled = st.sidebar.checkbox("리스크 시나리오 자동 분석 사용", value=default_ai)
     st.sidebar.caption("API Key는 `st.secrets['GEMINI_API_KEY']`에서만 읽습니다.")
 
     if uploaded is not None:
@@ -640,13 +731,13 @@ def main() -> None:
         if c in display_df.columns:
             column_config[c] = st.column_config.TextColumn(c)
 
-    st.dataframe(
-        style_risk_dataframe(display_df),
-        use_container_width=True,
-        height=420,
-        column_config=column_config,
-        hide_index=True,
-    )
+    dataframe_kwargs: dict[str, Any] = {"use_container_width": True, "height": 420}
+    if hasattr(st, "column_config"):
+        dataframe_kwargs["column_config"] = column_config
+    try:
+        st.dataframe(style_risk_dataframe(display_df), hide_index=True, **dataframe_kwargs)
+    except TypeError:
+        st.dataframe(style_risk_dataframe(display_df), **dataframe_kwargs)
 
     report_name = f"risk_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     st.download_button(
@@ -656,31 +747,51 @@ def main() -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    # Top 5 Grade A + Automated AI scenarios (cached)
+    st.subheader("Top 5 위험 품목 (Grade A)")
+    top5 = top_grade_a_items(dff, n=5)
+    if top5.empty:
+        st.info("Grade A 항목이 없습니다.")
+    else:
+        top5_view = top5[[c for c in ["품목코드", "품목명", "공급처", "필요수량", "재고", "단가", "비고", "RiskReason", "단가_volatility"] if c in top5.columns]].copy()
+        try:
+            st.dataframe(style_risk_dataframe(format_table_for_display(top5_view)), use_container_width=True, height=220, hide_index=True)
+        except TypeError:
+            st.dataframe(style_risk_dataframe(format_table_for_display(top5_view)), use_container_width=True, height=220)
+
+        if gemini_enabled:
+            st.subheader("AI 리스크 시나리오 (자동 분석)")
+            st.caption("주의: 민감정보가 포함될 수 있으니 전송 전에 검토하세요. (동일 Top5면 캐시로 재호출 방지)")
+
+            top5_h = hash_top_items(top5_view)
+            top5_json = top5_view.fillna("").to_json(orient="records", force_ascii=False)
+            with st.spinner("Gemini 자동 분석 중..."):
+                ok, msg, scenarios = gemini_scenarios_cached(top5_h, top5_json)
+
+            if not ok:
+                st.warning(msg)
+            else:
+                scen_df = pd.DataFrame(scenarios).fillna("-")
+                for c in ["품목코드", "품목명", "우선순위", "시나리오", "원인", "영향", "권장조치"]:
+                    if c not in scen_df.columns:
+                        scen_df[c] = "-"
+                scen_df = scen_df[["우선순위", "품목코드", "품목명", "시나리오", "원인", "영향", "권장조치"]]
+
+                st.markdown("**AI 시나리오 요약**")
+                try:
+                    st.dataframe(scen_df, use_container_width=True, height=240, hide_index=True)
+                except TypeError:
+                    st.dataframe(scen_df, use_container_width=True, height=240)
+
+                st.markdown("**AI 시나리오 상세**")
+                for _, r in scen_df.iterrows():
+                    with st.expander(f"[{r.get('우선순위','-')}] {r.get('품목코드','-')} · {r.get('품목명','-')}", expanded=False):
+                        st.write(f"시나리오: {r.get('시나리오','-')}")
+                        st.write(f"원인: {r.get('원인','-')}")
+                        st.write(f"영향: {r.get('영향','-')}")
+                        st.write(f"권장조치: {r.get('권장조치','-')}")
+
     build_charts(dff)
-
-    if gemini_enabled:
-        st.subheader("AI 시나리오 (Gemini, 단가/비고 기반)")
-        st.caption("주의: 민감정보가 포함될 수 있으니 전송 전에 검토하세요.")
-
-        only_high_risk = st.checkbox("Grade A만 분석", value=True)
-        target = dff.copy()
-        if only_high_risk and "Risk" in target.columns:
-            target = target[target["Risk"] == "A"].copy()
-
-        n = st.slider("분석할 항목 수(상위)", min_value=1, max_value=20, value=8)
-        if {"필요수량", "재고"}.issubset(target.columns):
-            target = target.assign(부족량=(target["필요수량"] - target["재고"]).clip(lower=0)).sort_values("부족량", ascending=False)
-        target = target.head(int(n))
-
-        target_view = target[[c for c in ["품목코드", "품목명", "공급처", "필요수량", "재고", "단가", "비고", "Risk", "RiskReason", "발주일", "입고예정", "입고일자", "단가_volatility"] if c in target.columns]].copy()
-        target_display = format_table_for_display(target_view)
-        st.dataframe(style_risk_dataframe(target_display), use_container_width=True, height=220, hide_index=True)
-
-        if st.button("Gemini로 Actionable Scenarios 생성", type="primary"):
-            with st.spinner("Gemini 분석 중..."):
-                ok, text = gemini_generate_scenarios(target)
-            (st.success if ok else st.error)("완료" if ok else "실패")
-            st.text_area("결과", value=text, height=280)
 
 
 if __name__ == "__main__":
